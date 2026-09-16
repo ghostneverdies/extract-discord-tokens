@@ -1,10 +1,11 @@
 # extract-discord-tokens
 ## extract discord tokens from discord client/browser level db files or from discord client windows by memory scanning and regex!
 
-this works for the latest discord client 2026 and uses 3 phase token extraction, the first phase is the traditional regex token extraction which on some machines no longer works and the 2nd phase is the fast memory scans,a full memory dump of discord proved that discord uses dynamic memory which changes every launch and this makes the memory offsets very unreliable but i did fine a stable authorization headers hex in memory dump observations and it never changes no matter how many times discord is restarted so that reduces the full memory scan which takes so much time and the third and final phase is full memory scan of the discord render processes which contain the authorization tokens and the last one is used as a fallback if discord updated the client and changed the observed memory hex that are stable so take into acount that updates wont break the functionality but they will increase memory scanning times which takes ~2 mins for a full memory scan on my end.The c++ script [main.cpp](https://github.com/ghostneverdies/extract-discord-tokens/edit/main/main.cpp) here prints found accounts in console
+this works for the latest discord client 2026 and uses 3 phase token extraction, the first phase is the traditional regex token extraction which on some machines no longer works and the 2nd phase is the fast memory scans,a full memory dump of discord proved that discord uses dynamic memory which changes every launch and this makes the memory offsets very unreliable but i did fine a stable authorization headers hex in memory dump observations and it never changes no matter how many times discord is restarted so that reduces the full memory scan which takes so much time and the third and final phase is full memory scan of the discord render processes which contain the authorization tokens and the last one is used as a fallback if discord updated the client and changed the observed memory hex that are stable so take into acount that updates wont break the functionality but they will increase memory scanning times which takes ~2 mins for a full memory scan on my end.The c++ script [main.cpp](https://github.com/ghostneverdies/extract-discord-tokens/edit/main/cpp/main.cpp) here prints found accounts in console.The Python and C# version do the same thing
 More Details Are Below On What I Found
 
 ## BUILD FROM SOURCE
+### C++ Version
 Step 1:Clone the repo
 
 ```
@@ -12,14 +13,46 @@ git clone https://github.com/ghostneverdies/extract-discord-tokens.git
 ```
 Step 2:Navigate To The Repo
 ```
-cd extract-discord-tokens
+cd extract-discord-tokens\cpp
 ```
 Step 3:Build
 ```
 .\build.bat
 ```
 
-NOTE THAT YOU SHOULD HAVE MSVC BUILD TOOLS INSTALLED TO BUILD FROM SOURCE OTHERWISE NOTHING WILL HAPPEN
+NOTE THAT YOU SHOULD HAVE MSVC BUILD TOOLS INSTALLED TO BUILD C++ VERSION FROM SOURCE OTHERWISE AN ERROR WILL COME IF YOU OPEN .\build.bat
+
+### C# Version
+```
+git clone https://github.com/ghostneverdies/extract-discord-tokens.git
+```
+Step 2:Navigate To The Repo
+```
+cd extract-discord-tokens\csharp
+```
+Step 3:Build
+```
+dotnet build
+```
+
+NOTE THAT YOU SHOULD HAVE DOTNET SDK AVAILABLE TO BUILD THE C# VERSION
+
+### Python Version
+```
+git clone https://github.com/ghostneverdies/extract-discord-tokens.git
+```
+Step 2:Navigate To The Repo
+```
+cd extract-discord-tokens\python
+```
+Step 3:Install The Requirements
+```
+pip install -r requirements.txt
+```
+Step 4:Run
+```
+python main.py
+```
 
 ## DISCORD TOKEN MEMORY FORENSICS - OBSERVED DETAILS (validated across Several Discord launches)
 
