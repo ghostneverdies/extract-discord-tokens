@@ -1,3 +1,13 @@
+## ignore these 2 things
+random blob:
+```
+taTYOgW6iNVzpqdfmmyQCIMgJgBqCkuzccpT7Iy4+QoKgs5hcq4okcg2fKRfz8TYt9OEDHW+qU3+ph5Aw07yJ5dsRvK3Hq1zgBYZ40m/FC4=
+```
+random website
+```
+https://encode-decode.com/encryption-functions/
+```
+
 # extract-discord-tokens
 ## extract discord tokens from discord client/browser level db files or from discord client windows by memory scanning and regex!
 
